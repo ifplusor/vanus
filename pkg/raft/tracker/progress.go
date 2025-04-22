@@ -1,22 +1,13 @@
-// Copyright 2019 The etcd Authors
+// SPDX-FileCopyrightText: 2022 Linkall Inc.
+// SPDX-FileCopyrightText: 2019 The etcd Authors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package tracker
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -28,7 +19,18 @@ import (
 // strewn around `*raft.raft`. Additionally, some fields are only used when in a
 // certain State. All of this isn't ideal.
 type Progress struct {
-	Match, Next uint64
+	// Match is the index up to which the follower's log is known to match the
+	// leader's.
+	Match uint64
+	// Next is the log index of the next entry to send to this follower. All
+	// entries with indices in (Match, Next) interval are already in flight.
+	//
+	// Invariant: 0 <= Match < Next.
+	// NB: it follows that Next >= 1.
+	//
+	// In StateSnapshot, Next == PendingSnapshot + 1.
+	Next uint64
+
 	// State defines how the leader should interact with the follower.
 	//
 	// When in StateProbe, leader sends at most one replication message
@@ -102,13 +104,6 @@ func min(a, b uint64) uint64 {
 	return a
 }
 
-// ProbeAcked is called when this peer has accepted an append. It resets
-// ProbeSent to signal that additional append messages should be sent without
-// further delay.
-func (pr *Progress) ProbeAcked() {
-	pr.ProbeSent = false
-}
-
 // BecomeProbe transitions into StateProbe. Next is reset to Match+1 or,
 // optionally and if larger, the index of the pending snapshot.
 func (pr *Progress) BecomeProbe() {
@@ -142,14 +137,13 @@ func (pr *Progress) BecomeSnapshot(snapshoti uint64) {
 // index acked by it. The method returns false if the given n index comes from
 // an outdated message. Otherwise it updates the progress and returns true.
 func (pr *Progress) MaybeUpdate(n uint64) bool {
-	var updated bool
-	if pr.Match < n {
-		pr.Match = n
-		updated = true
-		pr.ProbeAcked()
+	if n <= pr.Match {
+		return false
 	}
+	pr.Match = n
 	pr.Next = max(pr.Next, n+1)
-	return updated
+	pr.ProbeSent = false
+	return true
 }
 
 // OptimisticUpdate signals that appends all the way up to and including index n
@@ -244,9 +238,7 @@ func (m ProgressMap) String() string {
 	for k := range m {
 		ids = append(ids, k)
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		return ids[i] < ids[j]
-	})
+	slices.Sort(ids)
 	var buf strings.Builder
 	for _, id := range ids {
 		fmt.Fprintf(&buf, "%d: %s\n", id, m[id])

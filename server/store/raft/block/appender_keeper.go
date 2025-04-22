@@ -27,6 +27,21 @@ import (
 // Make sure appender implements raft.Keeper.
 var _ raft.Keeper = (*appender)(nil)
 
+func (a *appender) OnStateChanged(st raft.SoftState) {
+	// TODO(james.yin): dispatch to another goroutine.
+	a.leaderID = vanus.NewIDFromUint64(st.Lead)
+	if st.RaftState == raft.StateLeader {
+		a.becomeLeader(context.TODO())
+	}
+}
+
+func (a *appender) OnLeadCaughtUp() {
+}
+
+func (a *appender) OnNewSeal(seal uint64) {
+	// TODO(james.yean): report checkpoint
+}
+
 func (a *appender) SetHardState(st raftpb.HardState) {
 	a.commitExecutor.Execute(func() {
 		a.persistHardState(context.TODO(), st)
@@ -37,14 +52,6 @@ func (a *appender) CommitTo(index uint64) {
 	a.commitExecutor.Execute(func() {
 		a.storage.SetCommit(context.TODO(), index)
 	})
-}
-
-func (a *appender) SetSoftState(st raft.SoftState) {
-	// TODO(james.yin): dispatch to another goroutine.
-	a.leaderID = vanus.NewIDFromUint64(st.Lead)
-	if st.RaftState == raft.StateLeader {
-		a.becomeLeader(context.TODO())
-	}
 }
 
 func (a *appender) TruncateAndAppend(ents []raftpb.Entry) {

@@ -1,20 +1,12 @@
-// Copyright 2015 The etcd Authors
+// SPDX-FileCopyrightText: 2022 Linkall Inc.
+// SPDX-FileCopyrightText: 2015 The etcd Authors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package raft
 
 import (
+	// standard library.
 	"bytes"
 	"errors"
 	"fmt"
@@ -25,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	// this project.
 	"github.com/vanus-labs/vanus/pkg/raft/confchange"
 	"github.com/vanus-labs/vanus/pkg/raft/quorum"
 	pb "github.com/vanus-labs/vanus/pkg/raft/raftpb"
@@ -165,6 +158,16 @@ type Config struct {
 	// overflowing that sending buffer. TODO (xiangli): feedback to application to
 	// limit the proposal rate?
 	MaxInflightMsgs int
+	// MaxInflightBytes limits the number of in-flight bytes in append messages.
+	// Complements MaxInflightMsgs. Ignored if zero.
+	//
+	// This effectively bounds the bandwidth-delay product. Note that especially
+	// in high-latency deployments setting this too low can lead to a dramatic
+	// reduction in throughput. For example, with a peer that has a round-trip
+	// latency of 100ms to the leader and this setting is set to 1 MB, there is a
+	// throughput limit of 10 MB/s for this group. With RTT of 400ms, this drops
+	// to 2.5 MB/s. See Little's law to understand the maths behind.
+	MaxInflightBytes uint64
 
 	// CheckQuorum specifies if the leader should check quorum activity. Leader
 	// steps down when quorum is not active for an electionTimeout.
@@ -233,6 +236,11 @@ func (c *Config) validate() error {
 	if c.MaxInflightMsgs <= 0 {
 		return errors.New("max inflight messages must be greater than 0")
 	}
+	if c.MaxInflightBytes == 0 {
+		c.MaxInflightBytes = noLimit
+	} else if c.MaxInflightBytes < c.MaxSizePerMsg {
+		return errors.New("max inflight bytes must be >= max message size")
+	}
 
 	if c.Logger == nil {
 		c.Logger = getLogger()
@@ -253,7 +261,8 @@ type raft struct {
 
 	termStart uint64
 	receiving bool
-	voted     bool
+	// voted indicates whether the vote state is persisted, and ready to respond.
+	voted bool
 
 	readStates []ReadState
 
@@ -262,6 +271,7 @@ type raft struct {
 
 	maxMsgSize         uint64
 	maxUncommittedSize uint64
+
 	// TODO(tbg): rename to trk.
 	prs tracker.ProgressTracker
 
@@ -340,7 +350,7 @@ func newRaft(c *Config) *raft {
 		raftLog:                   raftlog,
 		maxMsgSize:                c.MaxSizePerMsg,
 		maxUncommittedSize:        c.MaxUncommittedEntriesSize,
-		prs:                       tracker.MakeProgressTracker(c.MaxInflightMsgs),
+		prs:                       tracker.MakeProgressTracker(c.MaxInflightMsgs, c.MaxInflightBytes),
 		electionTimeout:           c.ElectionTick,
 		heartbeatTimeout:          c.HeartbeatTick,
 		logger:                    c.Logger,
@@ -378,7 +388,7 @@ func newRaft(c *Config) *raft {
 	}
 
 	r.logger.Infof("newRaft %x [peers: [%s], term: %d, commit: %d, applied: %d, lastindex: %d, lastterm: %d]",
-		r.id, strings.Join(nodesStrs, ","), r.Term, r.raftLog.committed, r.raftLog.applied,
+		r.id, strings.Join(nodesStrs, ","), r.Term, r.raftLog.consensus, r.raftLog.applied,
 		r.raftLog.lastIndex(), r.raftLog.lastTerm())
 	return r
 }
@@ -398,7 +408,7 @@ func (r *raft) hardState() pb.HardState {
 	return pb.HardState{
 		Term:   r.Term,
 		Vote:   r.Vote,
-		Commit: r.raftLog.localCommitted,
+		Commit: r.raftLog.committed,
 	}
 }
 
@@ -455,82 +465,98 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 	if pr.IsPaused() {
 		return false
 	}
-	m := pb.Message{}
-	m.To = to
 
-	term, errt := r.raftLog.term(pr.Next - 1)
-	ents, erre := r.raftLog.entries(pr.Next, r.maxMsgSize)
+	prevIndex := pr.Next - 1
+	prevTerm, err := r.raftLog.term(prevIndex)
+	if err != nil {
+		// The log probably got truncated at >= pr.Next, so we can't catch up the
+		// follower log anymore. Send a snapshot instead.
+		return r.maybeSendSnapshot(to, pr)
+	}
+
+	ents, err := r.raftLog.entries(pr.Next, r.maxMsgSize)
 	if len(ents) == 0 && !sendIfEmpty {
 		return false
 	}
+	// TODO(pav-kv): move this check up to where err is returned.
+	if err != nil { // send a snapshot if we failed to get the entries
+		return r.maybeSendSnapshot(to, pr)
+	}
 
-	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
-		if !pr.RecentActive {
-			r.logger.Debugf("ignore sending snapshot to %x since it is not recently active", to)
-			return false
-		}
-
-		m.Type = pb.MsgSnap
-		snapshot, err := r.raftLog.snapshot()
-		if err != nil {
-			if err == ErrSnapshotTemporarilyUnavailable {
-				r.logger.Debugf("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
-				return false
-			}
-			panic(err) // TODO(bdarnell)
-		}
-		if IsEmptySnap(snapshot) {
-			panic("need non-empty snapshot")
-		}
-		m.Snapshot = snapshot
-		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
-		r.logger.Debugf("%x [firstIndex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
-			r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
-		pr.BecomeSnapshot(sindex)
-		r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
-	} else {
-		m.Type = pb.MsgApp
-		m.Index = pr.Next - 1
-		m.LogTerm = term
-		m.Entries = ents
-		m.Commit = r.raftLog.committed
-		m.Compact = r.raftLog.compacted
-		if n := len(m.Entries); n != 0 {
-			switch pr.State {
-			// optimistically increase the next when in StateReplicate
-			case tracker.StateReplicate:
-				last := m.Entries[n-1].Index
-				pr.OptimisticUpdate(last)
-				pr.Inflights.Add(last)
-			case tracker.StateProbe:
-				pr.ProbeSent = true
-			default:
-				r.logger.Panicf("%x is sending append in unhandled state %s", r.id, pr.State)
-			}
+	// Send the actual MsgApp otherwise, and update the progress accordingly.
+	r.send(pb.Message{
+		To:         to,
+		Type:       pb.MsgApp,
+		Index:      prevIndex,
+		LogTerm:    prevTerm,
+		Entries:    ents,
+		Commit:     r.raftLog.consensus,
+		Ack:        r.raftLog.ack,
+		Checkpoint: r.raftLog.seal,
+	})
+	if n := len(ents); n != 0 {
+		switch pr.State {
+		// optimistically increase the next when in StateReplicate
+		case tracker.StateReplicate:
+			last := ents[n-1].Index
+			pr.OptimisticUpdate(last)
+			pr.Inflights.Add(last, uint64(payloadsSize(ents)))
+		case tracker.StateProbe:
+			pr.ProbeSent = true
+		default:
+			r.logger.Panicf("%x is sending append in unhandled state %s", r.id, pr.State)
 		}
 	}
-	r.send(m)
+	return true
+}
+
+// maybeSendSnapshot fetches a snapshot from Storage, and sends it to the given
+// node. Returns true if the snapshot message has been emitted successfully.
+func (r *raft) maybeSendSnapshot(to uint64, pr *tracker.Progress) bool {
+	if !pr.RecentActive {
+		r.logger.Debugf("ignore sending snapshot to %x since it is not recently active", to)
+		return false
+	}
+
+	snapshot, err := r.raftLog.snapshot()
+	if err != nil {
+		if err == ErrSnapshotTemporarilyUnavailable {
+			r.logger.Debugf("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+			return false
+		}
+		panic(err) // TODO(bdarnell)
+	}
+	if IsEmptySnap(snapshot) {
+		panic("need non-empty snapshot")
+	}
+	sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+	r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
+		r.id, r.raftLog.firstIndex(), r.raftLog.consensus, sindex, sterm, to, pr)
+	pr.BecomeSnapshot(sindex)
+	r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
+
+	r.send(pb.Message{To: to, Type: pb.MsgSnap, Snapshot: snapshot})
 	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *raft) sendHeartbeat(to uint64, ctx []byte) {
-	// Attach the commit as min(to.matched, r.committed).
+	pr := r.prs.Progress[to]
+	// Attach the commit as min(to.matched, r.consensus).
 	// When the leader sends out heartbeat message,
 	// the receiver(follower) might not be matched with the leader
 	// or it might not have all the committed entries.
 	// The leader MUST NOT forward the follower's commit to
 	// an unmatched index.
-	commit := min(r.prs.Progress[to].Match, r.raftLog.committed)
-	m := pb.Message{
-		To:      to,
-		Type:    pb.MsgHeartbeat,
-		Commit:  commit,
-		Compact: r.raftLog.compacted,
-		Context: ctx,
-	}
-
-	r.send(m)
+	commit := min(pr.Match, r.raftLog.consensus)
+	r.send(pb.Message{
+		To:         to,
+		Type:       pb.MsgHeartbeat,
+		Commit:     commit,
+		Ack:        r.raftLog.ack,
+		Checkpoint: r.raftLog.checkpoint,
+		Context:    ctx,
+	})
 }
 
 // bcastAppend sends RPC, with entries to all peers that are not up-to-date
@@ -593,7 +619,7 @@ func (r *raft) advance(rd Ready) {
 				r.logger.Infof("initiating automatic transition out of joint configuration %s", r.prs.Config)
 			}
 
-			r.maybeCompact()
+			// r.maybeCompact()
 		}
 	}
 
@@ -608,14 +634,14 @@ func (r *raft) advance(rd Ready) {
 func (r *raft) maybeCommit() bool {
 	mci := r.prs.Committed()
 	if mci >= r.termStart {
-		return r.raftLog.maybeCommit(mci, r.Term)
+		return r.raftLog.consensusTo(mci)
 	}
 	return false
 }
 
-func (r *raft) maybeCompact() {
+func (r *raft) maybeAck() bool {
 	ack := r.prs.AllAcked()
-	r.raftLog.maybeCompact(ack)
+	return r.raftLog.ackTo(ack)
 }
 
 func (r *raft) reset(term uint64) {
@@ -638,7 +664,7 @@ func (r *raft) reset(term uint64) {
 		*pr = tracker.Progress{
 			Match:     0,
 			Next:      r.raftLog.lastIndex() + 1,
-			Inflights: tracker.NewInflights(r.prs.MaxInflight),
+			Inflights: tracker.NewInflights(r.prs.MaxInflight, r.prs.MaxInflightBytes),
 			IsLearner: pr.IsLearner,
 		}
 		if id == r.id {
@@ -724,7 +750,7 @@ func (r *raft) becomeFollower(term uint64, lead uint64) {
 
 	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
 
-	r.raftLog.keeper.SetSoftState(r.softState())
+	r.raftLog.keeper.OnStateChanged(r.softState())
 }
 
 func (r *raft) becomeFollowerExt(term uint64, lead uint64) {
@@ -748,7 +774,7 @@ func (r *raft) becomeCandidate() {
 
 	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
 
-	r.raftLog.keeper.SetSoftState(r.softState())
+	r.raftLog.keeper.OnStateChanged(r.softState())
 }
 
 func (r *raft) becomeCandidateExt() {
@@ -775,7 +801,7 @@ func (r *raft) becomePreCandidate() {
 
 	r.logger.Infof("%x became pre-candidate at term %d", r.id, r.Term)
 
-	r.raftLog.keeper.SetSoftState(r.softState())
+	r.raftLog.keeper.OnStateChanged(r.softState())
 }
 
 func (r *raft) becomeLeader() {
@@ -785,7 +811,7 @@ func (r *raft) becomeLeader() {
 	}
 
 	r.tick = r.tickHeartbeat
-	r.step = stepLeader
+	r.step = stepLeaderInitial
 	r.propose = proposeLeader
 
 	r.reset(r.Term)
@@ -818,7 +844,7 @@ func (r *raft) becomeLeader() {
 
 	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
 
-	r.raftLog.keeper.SetSoftState(r.softState())
+	r.raftLog.keeper.OnStateChanged(r.softState())
 }
 
 func (r *raft) hup(t CampaignType) {
@@ -831,17 +857,26 @@ func (r *raft) hup(t CampaignType) {
 		r.logger.Warningf("%x is unpromotable and can not campaign", r.id)
 		return
 	}
-	ents, err := r.raftLog.slice(r.raftLog.applied+1, r.raftLog.committed+1, noLimit)
-	if err != nil {
-		r.logger.Panicf("unexpected error getting unapplied entries (%v)", err)
-	}
-	if n := numOfPendingConf(ents); n != 0 && r.raftLog.committed > r.raftLog.applied {
-		r.logger.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+	if r.hasUnappliedConfChanges() {
+		r.logger.Warningf("%x cannot campaign at term %d since there are still pending configuration changes to apply", r.id, r.Term)
 		return
 	}
 
 	r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
 	r.campaign(t)
+}
+
+func (r *raft) hasUnappliedConfChanges() bool {
+	if r.raftLog.applied >= r.raftLog.consensus { // in fact applied == consensus
+		return false
+	}
+	// TODO(james.yean): paging
+	ents, err := r.raftLog.slice(r.raftLog.applied+1, r.raftLog.consensus+1, noLimit)
+	if err != nil {
+		r.logger.Panicf("unexpected error getting unapplied entries (%v)", err)
+	}
+	n := numOfPendingConf(ents)
+	return n != 0 && r.raftLog.consensus > r.raftLog.applied
 }
 
 // campaign transitions the raft instance to candidate state. This must only be
@@ -853,33 +888,22 @@ func (r *raft) campaign(t CampaignType) {
 		r.logger.Warningf("%x is unpromotable; campaign() should have been called", r.id)
 	}
 
-	var term uint64
-	var voteMsg pb.MessageType
 	if t == campaignPreElection {
 		r.becomePreCandidate()
 
-		if _, _, res := r.poll(r.id, pb.MsgPreVoteResp, true); res == quorum.VoteWon {
-			// We won the election after voting for ourselves (which must mean that
-			// this is a single-node cluster). Advance to the next state.
-			r.campaign(campaignElection)
-			return
+		var ctx []byte
+		if t == campaignTransfer {
+			ctx = []byte(t)
 		}
 
-		voteMsg = pb.MsgPreVote
 		// PreVote RPCs are sent for the next term before we've incremented r.Term.
-		term = r.Term + 1
+		r.bcastVote(r.Term+1, pb.MsgPreVote, ctx)
 	} else {
 		r.becomeCandidateExt()
-
-		voteMsg = pb.MsgVote
-		term = r.Term
 	}
+}
 
-	var ctx []byte
-	if t == campaignTransfer {
-		ctx = []byte(t)
-	}
-
+func (r *raft) bcastVote(term uint64, voteMsg pb.MessageType, ctx []byte) {
 	var ids []uint64
 	{
 		idMap := r.prs.Voters.IDs()
@@ -891,6 +915,12 @@ func (r *raft) campaign(t CampaignType) {
 	}
 	for _, id := range ids {
 		if id == r.id {
+			// The candidate votes for itself and should account for this self
+			// vote once the vote has been durably persisted (since it doesn't
+			// send a MsgVote to itself). This response message will be added to
+			// msgsAfterAppend and delivered back to this node after the vote
+			// has been written to stable storage.
+			r.send(pb.Message{To: id, Term: term, Type: voteRespMsgType(voteMsg)})
 			continue
 		}
 
@@ -914,22 +944,31 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int, rejected 
 	return r.prs.TallyVotes()
 }
 
-func (r *raft) Propose(pds ...ProposeData) {
-	ents := make([]pb.Entry, len(pds))
-	for i := range pds {
-		pd := &pds[i]
+func (r *raft) Propose(opts ProposeOptions) {
+	ents := make([]pb.Entry, len(opts.Data))
+	for i := range opts.Data {
+		pd := &opts.Data[i]
 		ents[i] = pb.Entry{
-			Type: pd.Type,
 			Data: pd.Data,
 		}
 	}
+
+	if opts.BeforeProposeHook != nil {
+		opts.BeforeProposeHook(ents)
+	}
+
 	err := r.propose(r, pb.Message{
 		Type:    pb.MsgProp,
 		From:    r.id,
 		Entries: ents,
 	})
-	for i := range pds {
-		pd := &pds[i]
+
+	if opts.AfterProposeHook != nil {
+		opts.AfterProposeHook(ents, err)
+	}
+
+	for i := range opts.Data {
+		pd := &opts.Data[i]
 		if pd.Callback == nil {
 			continue
 		}
@@ -1130,6 +1169,17 @@ func (r *raft) Step(m pb.Message) error {
 
 type stepFunc func(r *raft, m pb.Message) error
 
+func stepLeaderInitial(r *raft, m pb.Message) error {
+	if err := stepLeader(r, m); err != nil {
+		return err
+	}
+	if m.Type == pb.MsgApplyStatus && r.raftLog.applied >= r.termStart {
+		r.step = stepLeader
+		r.raftLog.keeper.OnLeadCaughtUp()
+	}
+	return nil
+}
+
 func stepLeader(r *raft, m pb.Message) error {
 	// These message types do not require any progress for m.From.
 	switch m.Type {
@@ -1165,8 +1215,10 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.prs.Progress[r.id].MaybeUpdate(m.Index)
 			if r.maybeCommit() {
 				r.bcastAppend()
-			} else {
-				r.raftLog.localCommitTo(r.raftLog.committed)
+			}
+			r.raftLog.refreshCommit()
+			if r.maybeAck() {
+				r.raftLog.maybeCompact()
 			}
 		}
 		return nil
@@ -1196,12 +1248,17 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.logger.Infof("initiating automatic transition out of joint configuration %s", r.prs.Config)
 		}
 
-		r.maybeCompact()
+		return nil
+	case pb.MsgCheckpointStatus:
+		if r.raftLog.checkpointTo(m.Index) {
+			r.raftLog.sealTo(m.Index, true)
+			r.raftLog.maybeCompact()
+		}
 		return nil
 	case pb.MsgReadIndex:
 		// only one voting member (the leader) in the cluster
 		if r.prs.IsSingleton() {
-			if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
+			if resp := r.responseToReadIndexReq(m, r.raftLog.consensus); resp.To != None {
 				r.send(resp)
 			}
 			return nil
@@ -1348,7 +1405,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				//    7, the rejection points it at the end of the follower's log
 				//    which is at a higher log term than the actually committed
 				//    log.
-				nextProbeIdx = r.raftLog.findConflictByTerm(m.RejectHint, m.LogTerm)
+				nextProbeIdx, _ = r.raftLog.findConflictByTerm(m.RejectHint, m.LogTerm)
 			}
 			if pr.MaybeDecrTo(m.Index, nextProbeIdx) {
 				r.logger.Debugf("%x decreased progress of %x to [%s]", r.id, m.From, pr)
@@ -1380,6 +1437,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				}
 
 				if r.maybeCommit() {
+					r.raftLog.refreshCommit()
 					// committed index has progressed for the term, so it is safe
 					// to respond to pending read index requests
 					releasePendingReadIndexMessages(r)
@@ -1398,7 +1456,9 @@ func stepLeader(r *raft, m pb.Message) error {
 				for r.maybeSendAppend(m.From, false) {
 				}
 
-				r.maybeCompact()
+				if r.maybeAck() {
+					r.raftLog.maybeCompact()
+				}
 
 				// Transfer leadership is in progress.
 				if m.From == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
@@ -1517,11 +1577,16 @@ func stepCandidate(r *raft, m pb.Message) error {
 		r.handleAppendEntries(m)
 	case pb.MsgLogStatus:
 		if r.raftLog.stableTo(m.Index, m.LogTerm) {
-			r.raftLog.localCommitTo(r.raftLog.committed)
+			r.raftLog.refreshCommit()
 		}
 	case pb.MsgApplyStatus:
 		// TODO(james.yin):
 		r.raftLog.appliedTo(m.Index)
+	case pb.MsgCheckpointStatus:
+		if r.raftLog.checkpointTo(m.Index) {
+			r.raftLog.maybeCompact()
+		}
+		return nil
 	case pb.MsgHeartbeat:
 		r.becomeFollower(m.Term, m.From) // always m.Term == r.Term
 		r.handleHeartbeat(m)
@@ -1529,7 +1594,11 @@ func stepCandidate(r *raft, m pb.Message) error {
 		r.becomeFollower(m.Term, m.From) // always m.Term == r.Term
 		r.handleSnapshot(m)
 	case pb.MsgStateStatus:
-		r.handleStatePersisted(m.LogTerm, m.Vote)
+		if m.LogTerm == r.Term {
+			// r.voted = true
+			// FIXME: transfer
+			r.bcastVote(r.Term, pb.MsgVote, nil)
+		}
 	case myVoteRespType:
 		gr, rj, res := r.poll(m.From, m.Type, !m.Reject)
 		r.logger.Infof("%x has received %d %s votes and %d vote rejections", r.id, gr, m.Type, rj)
@@ -1560,12 +1629,12 @@ func stepFollower(r *raft, m pb.Message) error {
 		r.electionElapsed = 0
 		if m.From != r.lead {
 			r.lead = m.From
-			r.raftLog.keeper.SetSoftState(r.softState())
+			r.raftLog.keeper.OnStateChanged(r.softState())
 		}
 		r.handleAppendEntries(m)
 	case pb.MsgLogStatus:
 		if r.raftLog.stableTo(m.Index, m.LogTerm) {
-			r.raftLog.localCommitTo(r.raftLog.committed)
+			r.raftLog.refreshCommit()
 			if r.receiving {
 				r.send(pb.Message{To: r.lead, Type: pb.MsgAppResp, Index: m.Index})
 			}
@@ -1573,6 +1642,11 @@ func stepFollower(r *raft, m pb.Message) error {
 	case pb.MsgApplyStatus:
 		// TODO(james.yin):
 		r.raftLog.appliedTo(m.Index)
+	case pb.MsgCheckpointStatus:
+		if r.raftLog.checkpointTo(m.Index) {
+			r.raftLog.maybeCompact()
+		}
+		return nil
 	case pb.MsgHeartbeat:
 		r.electionElapsed = 0
 		r.lead = m.From
@@ -1582,7 +1656,11 @@ func stepFollower(r *raft, m pb.Message) error {
 		r.lead = m.From
 		r.handleSnapshot(m)
 	case pb.MsgStateStatus:
-		r.handleStatePersisted(m.LogTerm, m.Vote)
+		if m.LogTerm == r.Term && m.Vote != None {
+			// Vote to other peer in current term.
+			r.voted = true
+			r.send(pb.Message{To: m.Vote, Term: r.Term, Type: pb.MsgVoteResp})
+		}
 	case pb.MsgTransferLeader:
 		if r.lead == None {
 			r.logger.Infof("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
@@ -1704,65 +1782,57 @@ func (r *raft) handleVote(from, term, index, logTerm uint64) {
 	}
 }
 
-func (r *raft) handleStatePersisted(term, vote uint64) {
-	switch {
-	case term != r.Term:
-	case vote == 0:
-	case vote == r.id:
-		if r.state == StateCandidate {
-			// Vote to ourself in current term.
-			if _, _, res := r.poll(r.id, pb.MsgVote, true); res == quorum.VoteWon {
-				r.becomeLeader()
-			}
-		}
-	default:
-		// Vote to other peer in current term.
-		r.voted = true
-		r.send(pb.Message{To: vote, Term: term, Type: pb.MsgVoteResp})
-	}
-}
-
 func (r *raft) handleAppendEntries(m pb.Message) {
-	if m.Index < r.raftLog.committed {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+	r.raftLog.sealTo(m.Checkpoint, false)
+
+	if r.raftLog.ackTo(m.Ack) {
+		r.raftLog.maybeCompact()
+	}
+
+	if m.Index < r.raftLog.consensus {
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.consensus})
 		return
 	}
 
-	if ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); !ok {
-		r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
-			r.id, r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
-
-		// Return a hint to the leader about the maximum index and term that the
-		// two logs could be divergent at. Do this by searching through the
-		// follower's log for the maximum (index, term) pair with a term <= the
-		// MsgApp's LogTerm and an index <= the MsgApp's Index. This can help
-		// skip all indexes in the follower's uncommitted tail with terms
-		// greater than the MsgApp's LogTerm.
-		//
-		// See the other caller for findConflictByTerm (in stepLeader) for a much
-		// more detailed explanation of this mechanism.
-		hintIndex := min(m.Index, r.raftLog.lastIndex())
-		hintIndex = r.raftLog.findConflictByTerm(hintIndex, m.LogTerm)
-		hintTerm, err := r.raftLog.term(hintIndex)
-		if err != nil {
-			panic(fmt.Sprintf("term(%d) must be valid, but got %v", hintIndex, err))
+	if ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
+		if !r.receiving {
+			r.receiving = true
 		}
-		r.send(pb.Message{
-			To:         m.From,
-			Type:       pb.MsgAppResp,
-			Index:      m.Index,
-			Reject:     true,
-			RejectHint: hintIndex,
-			LogTerm:    hintTerm,
-		})
-	} else if !r.receiving {
-		r.receiving = true
+		return
 	}
+
+	r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
+		r.id, r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
+
+	// Return a hint to the leader about the maximum index and term that the
+	// two logs could be divergent at. Do this by searching through the
+	// follower's log for the maximum (index, term) pair with a term <= the
+	// MsgApp's LogTerm and an index <= the MsgApp's Index. This can help
+	// skip all indexes in the follower's uncommitted tail with terms
+	// greater than the MsgApp's LogTerm.
+	//
+	// See the other caller for findConflictByTerm (in stepLeader) for a much
+	// more detailed explanation of this mechanism.
+	hintIndex := min(m.Index, r.raftLog.lastIndex())
+	hintIndex, hintTerm := r.raftLog.findConflictByTerm(hintIndex, m.LogTerm)
+	r.send(pb.Message{
+		To:         m.From,
+		Type:       pb.MsgAppResp,
+		Index:      m.Index,
+		Reject:     true,
+		RejectHint: hintIndex,
+		LogTerm:    hintTerm,
+	})
 }
 
 func (r *raft) handleHeartbeat(m pb.Message) {
-	r.raftLog.commitTo(m.Commit)
-	r.raftLog.compactTo(m.Compact)
+	r.raftLog.sealTo(m.Checkpoint, false)
+
+	if r.raftLog.ackTo(m.Ack) {
+		r.raftLog.maybeCompact()
+	}
+
+	r.raftLog.consensusTo(m.Commit)
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
 }
 
@@ -1770,12 +1840,12 @@ func (r *raft) handleSnapshot(m pb.Message) {
 	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
 	if r.restore(m.Snapshot) {
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
-			r.id, r.raftLog.committed, sindex, sterm)
+			r.id, r.raftLog.consensus, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
 	} else {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
-			r.id, r.raftLog.committed, sindex, sterm)
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+			r.id, r.raftLog.consensus, sindex, sterm)
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.consensus})
 	}
 }
 
@@ -1783,7 +1853,7 @@ func (r *raft) handleSnapshot(m pb.Message) {
 // configuration of state machine. If this method returns false, the snapshot was
 // ignored, either because it was obsolete or because of an error.
 func (r *raft) restore(s pb.Snapshot) bool {
-	if s.Metadata.Index <= r.raftLog.committed {
+	if s.Metadata.Index <= r.raftLog.consensus {
 		return false
 	}
 	if r.state != StateFollower {
@@ -1834,15 +1904,15 @@ func (r *raft) restore(s pb.Snapshot) bool {
 
 	if r.raftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
 		r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
-			r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
-		r.raftLog.commitTo(s.Metadata.Index)
+			r.id, r.raftLog.consensus, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+		r.raftLog.consensusTo(s.Metadata.Index)
 		return false
 	}
 
 	r.raftLog.restore(s)
 
 	// Reset the configuration and add the (potentially updated) peers in anew.
-	r.prs = tracker.MakeProgressTracker(r.prs.MaxInflight)
+	r.prs = tracker.MakeProgressTracker(r.prs.MaxInflight, r.prs.MaxInflightBytes)
 	cfg, prs, err := confchange.Restore(confchange.Changer{
 		Tracker:   r.prs,
 		LastIndex: r.raftLog.lastIndex(),
@@ -1859,7 +1929,7 @@ func (r *raft) restore(s pb.Snapshot) bool {
 	pr.MaybeUpdate(pr.Next - 1) // TODO(tbg): this is untested and likely unneeded
 
 	r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] restored snapshot [index: %d, term: %d]",
-		r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+		r.id, r.raftLog.consensus, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
 	return true
 }
 
@@ -1941,7 +2011,7 @@ func (r *raft) switchToConfig(cfg tracker.Config, prs tracker.ProgressMap) pb.Co
 		})
 	}
 
-	r.maybeCompact()
+	// r.maybeCompact()
 
 	// If the the leadTransferee was removed or demoted, abort the leadership transfer.
 	if _, tOK := r.prs.Config.Voters.IDs()[r.leadTransferee]; !tOK && r.leadTransferee != 0 {
@@ -1952,12 +2022,12 @@ func (r *raft) switchToConfig(cfg tracker.Config, prs tracker.ProgressMap) pb.Co
 }
 
 func (r *raft) loadState(state pb.HardState) {
-	if state.Commit < r.raftLog.localCommitted || state.Commit > r.raftLog.lastIndex() {
+	if state.Commit < r.raftLog.committed || state.Commit > r.raftLog.lastIndex() {
 		r.logger.Panicf("%x state.commit %d is out of range [%d, %d]", r.id, state.Commit,
-			r.raftLog.localCommitted, r.raftLog.lastIndex())
+			r.raftLog.committed, r.raftLog.lastIndex())
 	}
-	r.raftLog.localCommitted = state.Commit
 	r.raftLog.committed = state.Commit
+	r.raftLog.consensus = state.Commit
 	r.Term = state.Term
 	r.Vote = state.Vote
 }
@@ -1983,7 +2053,7 @@ func (r *raft) abortLeaderTransfer() {
 
 // committedEntryInCurrentTerm return true if the peer has committed an entry in its term.
 func (r *raft) committedEntryInCurrentTerm() bool {
-	return r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(r.raftLog.committed)) == r.Term
+	return r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(r.raftLog.consensus)) == r.Term
 }
 
 // responseToReadIndexReq constructs a response for `req`. If `req` comes from the peer
@@ -2085,12 +2155,12 @@ func sendMsgReadIndexResponse(r *raft, m pb.Message) {
 	switch r.readOnly.option {
 	// If more than the local vote is needed, go through a full broadcast.
 	case ReadOnlySafe:
-		r.readOnly.addRequest(r.raftLog.committed, m)
+		r.readOnly.addRequest(r.raftLog.consensus, m)
 		// The local node automatically acks the request.
 		r.readOnly.recvAck(r.id, m.Entries[0].Data)
 		r.bcastHeartbeatWithCtx(m.Entries[0].Data)
 	case ReadOnlyLeaseBased:
-		if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
+		if resp := r.responseToReadIndexReq(m, r.raftLog.consensus); resp.To != None {
 			r.send(resp)
 		}
 	}

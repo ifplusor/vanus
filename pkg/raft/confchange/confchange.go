@@ -37,9 +37,11 @@ type Changer struct {
 // config is empty and initializes it with a copy of the incoming (=left)
 // majority config. That is, it transitions from
 //
-//     (1 2 3)&&()
+//	(1 2 3)&&()
+//
 // to
-//     (1 2 3)&&(1 2 3).
+//
+//	(1 2 3)&&(1 2 3).
 //
 // The supplied changes are then applied to the incoming majority config,
 // resulting in a joint configuration that in terms of the Raft thesis[1]
@@ -267,7 +269,7 @@ func (c Changer) initProgress(cfg *tracker.Config, prs tracker.ProgressMap, id u
 		// Otherwise, CheckQuorum may cause us to step down if it is invoked
 		// before the added node has had a chance to communicate with us.
 		RecentActive: true,
-		Inflights:    tracker.NewInflights(c.Tracker.MaxInflight),
+		Inflights:    tracker.NewInflights(c.Tracker.MaxInflight, c.Tracker.MaxInflightBytes),
 		IsLearner:    isLearner,
 	}
 }

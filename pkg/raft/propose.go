@@ -25,13 +25,12 @@ import (
 type ProposeCallback = func(error)
 
 type ProposeData struct {
-	Type         pb.EntryType
 	Data         []byte
 	Callback     ProposeCallback
 	NoWaitCommit bool
 }
 
-type ProposeDataOption func(cfg *ProposeData)
+type ProposeDataOption func(pd *ProposeData)
 
 func Data(data []byte) ProposeDataOption {
 	return func(pd *ProposeData) {
@@ -51,22 +50,44 @@ func NoWaitCommit() ProposeDataOption {
 	}
 }
 
-type ProposeOption func(cfg *ProposeData)
+type ProposeOptions struct {
+	Data              []ProposeData
+	BeforeProposeHook func([]pb.Entry)
+	AfterProposeHook  func([]pb.Entry, error)
+}
+
+type ProposeOption func(po *ProposeOptions)
 
 func WithData(opts ...ProposeDataOption) ProposeOption {
-	return func(cfg *ProposeData) {
+	return func(po *ProposeOptions) {
+		data := ProposeData{}
 		for _, opt := range opts {
-			opt(cfg)
+			opt(&data)
 		}
+		po.Data = append(po.Data, data)
+	}
+}
+
+func WithBeforeProposeHook(hook func([]pb.Entry)) ProposeOption {
+	return func(po *ProposeOptions) {
+		po.BeforeProposeHook = hook
+	}
+}
+
+func WithAfterProposeHook(hook func([]pb.Entry, error)) ProposeOption {
+	return func(po *ProposeOptions) {
+		po.AfterProposeHook = hook
 	}
 }
 
 func Propose(ctx context.Context, n Node, opts ...ProposeOption) {
-	pds := make([]ProposeData, len(opts))
-	for i, opt := range opts {
-		opt(&pds[i])
+	po := ProposeOptions{
+		Data: make([]ProposeData, 0, len(opts)),
 	}
-	n.Propose(ctx, pds...)
+	for _, opt := range opts {
+		opt(&po)
+	}
+	n.Propose(ctx, po.Data...)
 }
 
 type proposeFuture chan error

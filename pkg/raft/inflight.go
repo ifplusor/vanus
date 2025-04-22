@@ -14,7 +14,13 @@
 
 package raft
 
-import "sort"
+import (
+	"errors"
+	"sort"
+)
+
+// ErrProposalDropped is returned when a proposal is truncated by new leader.
+var ErrProposalRejected = errors.New("raft proposal rejected")
 
 type waiter struct {
 	index uint64
@@ -61,7 +67,7 @@ func (in *inflight) truncateFrom(index uint64) {
 		in.waiters = in.waiters[:n]
 		// TODO(james.yin): invoke callbacks in other goroutine
 		for _, w := range dropped {
-			w.cb(ErrProposalDropped)
+			w.cb(ErrProposalRejected)
 		}
 	}
 }

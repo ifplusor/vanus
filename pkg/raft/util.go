@@ -229,6 +229,26 @@ func doLimitSize(ents []pb.Entry, maxSize uint64) []pb.Entry {
 	return ents[:limit]
 }
 
+// entryPayloadSize represents the size of one or more entries' payloads.
+// Notably, it does not depend on its Index or Term. Entries with empty
+// payloads, like those proposed after a leadership change, are considered
+// to be zero size.
+type entryPayloadSize uint64
+
+// payloadSize is the size of the payload of the provided entry.
+func payloadSize(e pb.Entry) entryPayloadSize {
+	return entryPayloadSize(len(e.Data))
+}
+
+// payloadsSize is the size of the payloads of the provided entries.
+func payloadsSize(ents []pb.Entry) entryPayloadSize {
+	var s entryPayloadSize
+	for _, e := range ents {
+		s += payloadSize(e)
+	}
+	return s
+}
+
 func assertConfStatesEquivalent(l Logger, cs1, cs2 pb.ConfState) {
 	err := cs1.Equivalent(cs2)
 	if err == nil {

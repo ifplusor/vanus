@@ -15,127 +15,143 @@
 package tracker
 
 import (
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestInflightsAdd(t *testing.T) {
 	// no rotating case
 	in := &Inflights{
 		size:   10,
-		buffer: make([]uint64, 10),
+		buffer: make([]inflight, 10),
 	}
 
 	for i := 0; i < 5; i++ {
-		in.Add(uint64(i))
+		in.Add(uint64(i), uint64(100+i))
 	}
 
 	wantIn := &Inflights{
 		start: 0,
 		count: 5,
+		bytes: 510,
 		size:  10,
-		//               ↓------------
-		buffer: []uint64{0, 1, 2, 3, 4, 0, 0, 0, 0, 0},
+		buffer: inflightsBuffer(
+			//       ↓------------
+			[]uint64{0, 1, 2, 3, 4, 0, 0, 0, 0, 0},
+			[]uint64{100, 101, 102, 103, 104, 0, 0, 0, 0, 0}),
 	}
-
-	if !reflect.DeepEqual(in, wantIn) {
-		t.Fatalf("in = %+v, want %+v", in, wantIn)
-	}
+	require.Equal(t, wantIn, in)
 
 	for i := 5; i < 10; i++ {
-		in.Add(uint64(i))
+		in.Add(uint64(i), uint64(100+i))
 	}
 
 	wantIn2 := &Inflights{
 		start: 0,
 		count: 10,
+		bytes: 1045,
 		size:  10,
-		//               ↓---------------------------
-		buffer: []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+		buffer: inflightsBuffer(
+			//       ↓---------------------------
+			[]uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+			[]uint64{100, 101, 102, 103, 104, 105, 106, 107, 108, 109}),
 	}
-
-	if !reflect.DeepEqual(in, wantIn2) {
-		t.Fatalf("in = %+v, want %+v", in, wantIn2)
-	}
+	require.Equal(t, wantIn2, in)
 
 	// rotating case
 	in2 := &Inflights{
 		start:  5,
 		size:   10,
-		buffer: make([]uint64, 10),
+		buffer: make([]inflight, 10),
 	}
 
 	for i := 0; i < 5; i++ {
-		in2.Add(uint64(i))
+		in2.Add(uint64(i), uint64(100+i))
 	}
 
 	wantIn21 := &Inflights{
 		start: 5,
 		count: 5,
+		bytes: 510,
 		size:  10,
-		//                              ↓------------
-		buffer: []uint64{0, 0, 0, 0, 0, 0, 1, 2, 3, 4},
+		buffer: inflightsBuffer(
+			//                      ↓------------
+			[]uint64{0, 0, 0, 0, 0, 0, 1, 2, 3, 4},
+			[]uint64{0, 0, 0, 0, 0, 100, 101, 102, 103, 104}),
 	}
-
-	if !reflect.DeepEqual(in2, wantIn21) {
-		t.Fatalf("in = %+v, want %+v", in2, wantIn21)
-	}
+	require.Equal(t, wantIn21, in2)
 
 	for i := 5; i < 10; i++ {
-		in2.Add(uint64(i))
+		in2.Add(uint64(i), uint64(100+i))
 	}
 
 	wantIn22 := &Inflights{
 		start: 5,
 		count: 10,
+		bytes: 1045,
 		size:  10,
-		//               -------------- ↓------------
-		buffer: []uint64{5, 6, 7, 8, 9, 0, 1, 2, 3, 4},
+		buffer: inflightsBuffer(
+			//       -------------- ↓------------
+			[]uint64{5, 6, 7, 8, 9, 0, 1, 2, 3, 4},
+			[]uint64{105, 106, 107, 108, 109, 100, 101, 102, 103, 104}),
 	}
-
-	if !reflect.DeepEqual(in2, wantIn22) {
-		t.Fatalf("in = %+v, want %+v", in2, wantIn22)
-	}
+	require.Equal(t, wantIn22, in2)
 }
 
 func TestInflightFreeTo(t *testing.T) {
 	// no rotating case
-	in := NewInflights(10)
+	in := NewInflights(10, 0)
 	for i := 0; i < 10; i++ {
-		in.Add(uint64(i))
+		in.Add(uint64(i), uint64(100+i))
 	}
+
+	in.FreeLE(0)
+
+	wantIn0 := &Inflights{
+		start: 1,
+		count: 9,
+		bytes: 945,
+		size:  10,
+		buffer: inflightsBuffer(
+			//          ↓------------------------
+			[]uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+			[]uint64{100, 101, 102, 103, 104, 105, 106, 107, 108, 109}),
+	}
+	require.Equal(t, wantIn0, in)
 
 	in.FreeLE(4)
 
 	wantIn := &Inflights{
 		start: 5,
 		count: 5,
+		bytes: 535,
 		size:  10,
-		//                              ↓------------
-		buffer: []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+		buffer: inflightsBuffer(
+			//                      ↓------------
+			[]uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+			[]uint64{100, 101, 102, 103, 104, 105, 106, 107, 108, 109}),
 	}
-
-	if !reflect.DeepEqual(in, wantIn) {
-		t.Fatalf("in = %+v, want %+v", in, wantIn)
-	}
+	require.Equal(t, wantIn, in)
 
 	in.FreeLE(8)
 
 	wantIn2 := &Inflights{
 		start: 9,
 		count: 1,
+		bytes: 109,
 		size:  10,
-		//                                          ↓
-		buffer: []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+		buffer: inflightsBuffer(
+			//                                  ↓
+			[]uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+			[]uint64{100, 101, 102, 103, 104, 105, 106, 107, 108, 109}),
 	}
-
-	if !reflect.DeepEqual(in, wantIn2) {
-		t.Fatalf("in = %+v, want %+v", in, wantIn2)
-	}
+	require.Equal(t, wantIn2, in)
 
 	// rotating case
 	for i := 10; i < 15; i++ {
-		in.Add(uint64(i))
+		in.Add(uint64(i), uint64(100+i))
 	}
 
 	in.FreeLE(12)
@@ -143,14 +159,14 @@ func TestInflightFreeTo(t *testing.T) {
 	wantIn3 := &Inflights{
 		start: 3,
 		count: 2,
+		bytes: 227,
 		size:  10,
-		//                           ↓-----
-		buffer: []uint64{10, 11, 12, 13, 14, 5, 6, 7, 8, 9},
+		buffer: inflightsBuffer(
+			//                   ↓-----
+			[]uint64{10, 11, 12, 13, 14, 5, 6, 7, 8, 9},
+			[]uint64{110, 111, 112, 113, 114, 105, 106, 107, 108, 109}),
 	}
-
-	if !reflect.DeepEqual(in, wantIn3) {
-		t.Fatalf("in = %+v, want %+v", in, wantIn3)
-	}
+	require.Equal(t, wantIn3, in)
 
 	in.FreeLE(14)
 
@@ -158,32 +174,104 @@ func TestInflightFreeTo(t *testing.T) {
 		start: 0,
 		count: 0,
 		size:  10,
-		//               ↓
-		buffer: []uint64{10, 11, 12, 13, 14, 5, 6, 7, 8, 9},
+		buffer: inflightsBuffer(
+			//       ↓
+			[]uint64{10, 11, 12, 13, 14, 5, 6, 7, 8, 9},
+			[]uint64{110, 111, 112, 113, 114, 105, 106, 107, 108, 109}),
 	}
+	require.Equal(t, wantIn4, in)
+}
 
-	if !reflect.DeepEqual(in, wantIn4) {
-		t.Fatalf("in = %+v, want %+v", in, wantIn4)
+func TestInflightsFull(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		size     int
+		maxBytes uint64
+		fullAt   int
+		freeLE   uint64
+		againAt  int
+	}{
+		{name: "always-full", size: 0, fullAt: 0},
+		{name: "single-entry", size: 1, fullAt: 1, freeLE: 1, againAt: 2},
+		{name: "single-entry-overflow", size: 1, maxBytes: 10, fullAt: 1, freeLE: 1, againAt: 2},
+		{name: "multi-entry", size: 15, fullAt: 15, freeLE: 6, againAt: 22},
+		{name: "slight-overflow", size: 8, maxBytes: 400, fullAt: 4, freeLE: 2, againAt: 7},
+		{name: "exact-max-bytes", size: 8, maxBytes: 406, fullAt: 4, freeLE: 3, againAt: 8},
+		{name: "larger-overflow", size: 15, maxBytes: 408, fullAt: 5, freeLE: 1, againAt: 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := NewInflights(tc.size, tc.maxBytes)
+
+			addUntilFull := func(begin, end int) {
+				for i := begin; i < end; i++ {
+					require.False(t, in.Full(), "full at %d, want %d", i, end)
+					in.Add(uint64(i), uint64(100+i))
+				}
+				require.True(t, in.Full(), "not full at %d", end)
+			}
+
+			addUntilFull(0, tc.fullAt)
+			in.FreeLE(tc.freeLE)
+			addUntilFull(tc.fullAt, tc.againAt)
+
+			defer func() {
+				assert.NotNil(t, recover(), "Add() did not panic")
+			}()
+			in.Add(100, 1024)
+		})
 	}
 }
 
-func TestInflightFreeFirstOne(t *testing.T) {
-	in := NewInflights(10)
-	for i := 0; i < 10; i++ {
-		in.Add(uint64(i))
+func TestInflightsReset(t *testing.T) {
+	in := NewInflights(10, 1000)
+	// Imitate a semi-realistic flow during which the inflight tracker is
+	// periodically reset to empty. Byte usage must not "leak" across resets.
+	index := uint64(0)
+	for epoch := 0; epoch < 100; epoch++ {
+		in.reset()
+		// Add 5 messages. They should not max out the limit yet.
+		for i := 0; i < 5; i++ {
+			require.False(t, in.Full())
+			index++
+			in.Add(index, 16)
+		}
+		// Ack all but last 2 indices.
+		in.FreeLE(index - 2)
+		require.False(t, in.Full())
+		require.Equal(t, 2, in.Count())
 	}
-
-	in.FreeFirstOne()
-
-	wantIn := &Inflights{
-		start: 1,
-		count: 9,
-		size:  10,
-		//                  ↓------------------------
-		buffer: []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
-	}
-
-	if !reflect.DeepEqual(in, wantIn) {
-		t.Fatalf("in = %+v, want %+v", in, wantIn)
-	}
+	in.FreeLE(index)
+	require.Equal(t, 0, in.Count())
 }
+
+func inflightsBuffer(indices []uint64, sizes []uint64) []inflight {
+	if len(indices) != len(sizes) {
+		panic("len(indices) != len(sizes)")
+	}
+	buffer := make([]inflight, 0, len(indices))
+	for i, idx := range indices {
+		buffer = append(buffer, inflight{index: idx, bytes: sizes[i]})
+	}
+	return buffer
+}
+
+// func TestInflightFreeFirstOne(t *testing.T) {
+// 	in := NewInflights(10, 1000)
+// 	for i := 0; i < 10; i++ {
+// 		in.Add(uint64(i))
+// 	}
+
+// 	in.FreeFirstOne()
+
+// 	wantIn := &Inflights{
+// 		start: 1,
+// 		count: 9,
+// 		size:  10,
+// 		//                  ↓------------------------
+// 		buffer: []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+// 	}
+
+// 	if !reflect.DeepEqual(in, wantIn) {
+// 		t.Fatalf("in = %+v, want %+v", in, wantIn)
+// 	}
+// }

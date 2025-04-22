@@ -1,23 +1,16 @@
-// Copyright 2015 The etcd Authors
+// SPDX-FileCopyrightText: 2022 Linkall Inc.
+// SPDX-FileCopyrightText: 2015 The etcd Authors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package raft
 
 import (
+	// standard library.
 	"fmt"
 	"log"
 
+	// this project.
 	pb "github.com/vanus-labs/vanus/pkg/raft/raftpb"
 )
 
@@ -36,24 +29,35 @@ type raftLog struct {
 	// persisting is the next log position that will be persisted to storage.
 	// Invariant: unstable.offset <= persisting
 	persisting uint64
-	// committed is the highest log position that is known to be in
-	// stable storage on a quorum of nodes.
-	// Invariant: committed < unstable.offset + len(unstable.entries)
+	// Invariant: committed = min(consensus, unstable.offset - 1)
 	committed uint64
-	// Invariant: localCommitted = min(committed, unstable.offset)
-	localCommitted uint64
 	// applying is the highest log position that the application has
-	// been instructed to be applying to its state machine.
-	// Invariant: applying <= localCommitted
+	// been instructed to apply to its state machine. Some of these
+	// entries may be in the process of applying and have not yet
+	// reached applied.
+	// Invariant: applying <= committed
 	applying uint64
 	// applied is the highest log position that the application has
-	// been instructed to apply to its state machine.
+	// successfully applied to its state machine.
 	// Invariant: applied <= applying
 	applied uint64
-	// compacted is the highest log position that the application can
+	// checkpoint is the highest log position that the application can
 	// delete safety.
-	// Invariant: compacted <= applied
+	// Invariant: checkpoint <= applied
+	checkpoint uint64
+	// compacted is the highest log position that the application has
+	// deleted.
+	// Invariant: compacted <= checkpoint
 	compacted uint64
+
+	// ack is the highest log position that has been propagated to
+	// all nodes in the cluster.
+	ack uint64
+	// consensus is the highest log position that is known to be in
+	// stable storage on a quorum of nodes. It is the leader commit.
+	consensus uint64
+	// seal is the latest checkpoint in the leader.
+	seal uint64
 
 	logger Logger
 
@@ -93,8 +97,8 @@ func newLogWithSize(storage Storage, keeper Keeper, logger Logger, maxNextEntsSi
 	log.unstable.logger = logger
 	log.persisting = lastIndex + 1
 	// Initialize our committed and applied pointers to the time of the last compaction.
+	log.consensus = firstIndex - 1
 	log.committed = firstIndex - 1
-	log.localCommitted = firstIndex - 1
 	log.applying = firstIndex - 1
 	log.applied = firstIndex - 1
 	log.compacted = firstIndex - 1
@@ -104,11 +108,12 @@ func newLogWithSize(storage Storage, keeper Keeper, logger Logger, maxNextEntsSi
 
 func (l *raftLog) String() string {
 	return fmt.Sprintf("committed=%d, applied=%d, unstable.offset=%d, len(unstable.Entries)=%d",
-		l.committed, l.applied, l.unstable.offset, len(l.unstable.entries))
+		l.consensus, l.applied, l.unstable.offset, len(l.unstable.entries))
 }
 
 // maybeAppend returns false if the entries cannot be appended. Otherwise, it returns true.
 func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (ok bool) {
+	// Check previous entry
 	if !l.matchTerm(index, logTerm) {
 		return false
 	}
@@ -117,8 +122,8 @@ func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry
 	ci := l.findConflict(ents)
 	switch {
 	case ci == 0:
-	case ci <= l.committed:
-		l.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
+	case ci <= l.consensus:
+		l.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.consensus)
 	default:
 		offset := index + 1
 		if ci-offset > uint64(len(ents)) {
@@ -126,7 +131,9 @@ func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry
 		}
 		l.append(ents[ci-offset:]...)
 	}
-	l.commitTo(min(committed, li))
+	if l.consensusTo(min(committed, li)) {
+		l.refreshCommit()
+	}
 	return true
 }
 
@@ -134,12 +141,12 @@ func (l *raftLog) append(ents ...pb.Entry) uint64 {
 	if len(ents) == 0 {
 		return l.lastIndex()
 	}
-	if prev := ents[0].Index - 1; prev < l.committed {
-		l.logger.Panicf("prev(%d) is out of range [committed(%d)]", prev, l.committed)
+	if prev := ents[0].Index - 1; prev < l.consensus {
+		l.logger.Panicf("prev(%d) is out of range [committed(%d)]", prev, l.consensus)
 	}
 
-	li, truncated := l.unstable.truncateAndAppend(ents)
-	start := ents[0].Index
+	ents, truncated := l.unstable.truncateAndAppend(ents)
+	start, li := ents[0].Index, ents[len(ents)-1].Index
 	if truncated {
 		l.inflight.truncateFrom(start)
 	}
@@ -179,34 +186,31 @@ func (l *raftLog) findConflict(ents []pb.Entry) uint64 {
 	return 0
 }
 
-// findConflictByTerm takes an (index, term) pair (indicating a conflicting log
-// entry on a leader/follower during an append) and finds the largest index in
-// log l with a term <= `term` and an index <= `index`. If no such index exists
-// in the log, the log's first index is returned.
+// findConflictByTerm returns a best guess on where this log ends matching
+// another log, given that the only information known about the other log is the
+// (index, term) of its single entry.
 //
-// The index provided MUST be equal to or less than l.lastIndex(). Invalid
-// inputs log a warning and the input index is returned.
-func (l *raftLog) findConflictByTerm(index uint64, term uint64) uint64 {
-	if li := l.lastIndex(); index > li {
-		// NB: such calls should not exist, but since there is a straightfoward
-		// way to recover, do it.
-		//
-		// It is tempting to also check something about the first index, but
-		// there is odd behavior with peers that have no log, in which case
-		// lastIndex will return zero and firstIndex will return one, which
-		// leads to calls with an index of zero into this method.
-		l.logger.Warningf("index(%d) is out of range [0, lastIndex(%d)] in findConflictByTerm",
-			index, li)
-		return index
-	}
-	for {
-		logTerm, err := l.term(index)
-		if logTerm <= term || err != nil {
-			break
+// Specifically, the first returned value is the max guessIndex <= index, such
+// that term(guessIndex) <= term or term(guessIndex) is not known (because this
+// index is compacted or not yet stored).
+//
+// The second returned value is the term(guessIndex), or 0 if it is unknown.
+//
+// This function is used by a follower and leader to resolve log conflicts after
+// an unsuccessful append to a follower, and ultimately restore the steady flow
+// of appends.
+func (l *raftLog) findConflictByTerm(index uint64, term uint64) (uint64, uint64) {
+	for ; index > 0; index-- {
+		// If there is an error (likely ErrCompacted or ErrUnavailable), we don't
+		// know whether it's a match or not, so assume a possible match and return
+		// the index, with 0 term indicating an unknown term.
+		if ourTerm, err := l.term(index); err != nil {
+			return index, 0
+		} else if ourTerm <= term {
+			return index, ourTerm
 		}
-		index--
 	}
-	return index
+	return 0, 0
 }
 
 // hasPendingSnapshot returns if there is pending snapshot waiting for applying.
@@ -247,15 +251,61 @@ func (l *raftLog) stableLastIndex() uint64 { //nolint:unused // ok
 	return i
 }
 
-func (l *raftLog) compactTo(tocompact uint64) {
-	if l.applied < tocompact {
-		l.logger.Debugf("tocompact(%d) is less then applied(%d).", tocompact, l.applied)
-		tocompact = l.applied
+func (l *raftLog) ackTo(ack uint64) bool {
+	// never decrease ack
+	if l.ack < ack {
+		l.ack = ack
+		return true
 	}
+	return false
+}
+
+func (l *raftLog) consensusTo(consensus uint64) bool {
+	// never decrease consensus
+	if l.consensus < consensus {
+		l.consensus = consensus
+		return true
+	}
+	return false
+}
+
+func (l *raftLog) sealTo(seal uint64, quiet bool) {
+	// never decrease seal
+	if l.seal < seal {
+		l.seal = seal
+		if !quiet {
+			l.keeper.OnNewSeal(seal)
+		}
+	}
+}
+
+func (l *raftLog) maybeCompact() {
+	compact := min(l.checkpoint, l.ack)
+	l.compactTo(compact)
+}
+
+func (l *raftLog) compactTo(tocompact uint64) {
+	if tocompact > l.checkpoint {
+		l.logger.Debugf("new compacted(%d) is greater than checkpoint(%d).", tocompact, l.checkpoint)
+		tocompact = l.checkpoint
+	}
+	// never decrease compacted
 	if l.compacted < tocompact {
 		l.compacted = tocompact
 		l.keeper.CompactTo(tocompact)
 	}
+}
+
+func (l *raftLog) checkpointTo(checkpoint uint64) bool {
+	if l.applied < checkpoint {
+		l.logger.Debugf("new checkpoint(%d) is greater than applied(%d).", checkpoint, l.applied)
+	}
+	// never decrease checkpoint
+	if l.checkpoint < checkpoint {
+		l.checkpoint = checkpoint
+		return true
+	}
+	return false
 }
 
 func (l *raftLog) appliedTo(i uint64) {
@@ -272,22 +322,24 @@ func (l *raftLog) applyingTo(i uint64) {
 	if i == 0 {
 		return
 	}
-	if l.localCommitted < i || i < l.applying {
-		l.logger.Panicf("applied(%d) is out of range [prevApplying(%d), localCommitted(%d)]", i, l.applying, l.localCommitted)
+	if l.committed < i || i < l.applying {
+		l.logger.Panicf("applied(%d) is out of range [prevApplying(%d), localCommitted(%d)]", i, l.applying, l.committed)
 	}
 	l.applying = i
 }
 
-func (l *raftLog) localCommitTo(tocommit uint64) {
-	if tocommit >= l.unstable.offset {
-		tocommit = l.unstable.offset - 1
-	}
+func (l *raftLog) refreshCommit() {
+	commit := min(l.consensus, l.unstable.offset-1)
+	l.commitTo(commit)
+}
+
+func (l *raftLog) commitTo(tocommit uint64) {
 	// never decrease commit
-	if l.localCommitted < tocommit {
+	if l.committed < tocommit {
 		// if li := l.stableLastIndex(); li < tocommit {
 		// 	l.logger.Panicf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, li)
 		// }
-		l.localCommitted = tocommit
+		l.committed = tocommit
 		l.inflight.commitTo(tocommit)
 		l.keeper.CommitTo(tocommit)
 
@@ -299,17 +351,6 @@ func (l *raftLog) localCommitTo(tocommit uint64) {
 		l.keeper.Apply(ents)
 		l.applying = tocommit
 	}
-}
-
-func (l *raftLog) commitTo(tocommit uint64) {
-	// never decrease commit
-	if l.committed < tocommit {
-		if li := l.lastIndex(); li < tocommit {
-			l.logger.Panicf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, li)
-		}
-		l.committed = tocommit
-	}
-	l.localCommitTo(tocommit)
 }
 
 func (l *raftLog) persistingTo(i, t uint64) {
@@ -405,6 +446,12 @@ func (l *raftLog) allEntries() []pb.Entry {
 	panic(err)
 }
 
+func (l *raftLog) unsealedEntries() (uint64, []pb.Entry, error) {
+	lo := l.seal + 1
+	ents, err := l.slice(l.seal+1, l.applied+1, noLimit)
+	return lo, ents, err
+}
+
 // isUpToDate determines if the given (lastIndex,term) log is more up-to-date
 // by comparing the index and term of the last entries in the existing logs.
 // If the logs have last entries with different terms, then the log with the
@@ -423,25 +470,10 @@ func (l *raftLog) matchTerm(i, term uint64) bool {
 	return t == term
 }
 
-func (l *raftLog) maybeCommit(maxIndex, term uint64) bool {
-	if maxIndex > l.committed /* && l.zeroTermOnErrCompacted(l.term(maxIndex)) == term */ {
-		l.commitTo(maxIndex)
-		return true
-	}
-	return false
-}
-
-func (l *raftLog) maybeCompact(i uint64) {
-	compacted := min(l.applied, i)
-	if compacted > l.compacted {
-		l.compactTo(compacted)
-	}
-}
-
 func (l *raftLog) restore(s pb.Snapshot) {
 	l.logger.Infof("log [%s] starts to restore snapshot [index: %d, term: %d]", l, s.Metadata.Index, s.Metadata.Term)
+	l.consensus = s.Metadata.Index
 	l.committed = s.Metadata.Index
-	l.localCommitted = s.Metadata.Index
 	// NOTE: applied and compacted will be reset in raft.advance().
 	l.unstable.restore(s)
 	l.persisting = l.unstable.offset
@@ -495,10 +527,10 @@ func (l *raftLog) mustCheckOutOfBounds(lo, hi uint64) error {
 		l.logger.Panicf("invalid slice %d > %d", lo, hi)
 	}
 
-	// fi := l.firstIndex()
-	// if lo < fi {
-	// 	return ErrCompacted
-	// }
+	fi := l.firstIndex()
+	if lo < fi {
+		return ErrCompacted
+	}
 
 	li := l.lastIndex()
 	if hi > li+1 {

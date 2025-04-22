@@ -31,7 +31,7 @@ func (a *appender) step(msg *raftpb.Message) {
 
 func (a *appender) propose(pds ...raft.ProposeData) {
 	a.raftExecutor.Execute(func() {
-		a.node.Propose(pds...)
+		a.node.Propose(raft.ProposeOptions{Data: pds})
 	})
 }
 
@@ -50,6 +50,7 @@ func (a *appender) reportLogStatus(_ context.Context, index, term uint64) {
 func (a *appender) reportApplyStatus(_ context.Context, index uint64) {
 	a.raftExecutor.Execute(func() {
 		_ = a.node.ReportApplyStatus(index)
+		// TODO(james.yean): report checkpoint
 	})
 }
 

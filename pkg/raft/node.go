@@ -343,7 +343,7 @@ func (n *node) run() { //nolint:funlen // ok
 		// described in raft dissertation)
 		// Currently it is dropped in Step silently.
 		case pds := <-propc:
-			r.Propose(pds...)
+			r.Propose(ProposeOptions{Data: pds})
 		case m := <-n.recvc:
 			if IsResponseMsg(m.Type) && r.prs.Progress[m.From] == nil {
 				// Filter out response message from unknown From.
