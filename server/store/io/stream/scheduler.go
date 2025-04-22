@@ -33,7 +33,7 @@ type Scheduler interface {
 type scheduler struct {
 	e  engine.Interface
 	bp *block.BufferPool
-	pq pendingQueue
+	pq PendingQueue
 
 	callbackExecutor executor.MultiFlow
 }

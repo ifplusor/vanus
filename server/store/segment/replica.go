@@ -24,7 +24,6 @@ import (
 	vanus "github.com/vanus-labs/vanus/api/vsr"
 
 	// this project.
-
 	"github.com/vanus-labs/vanus/server/store/block"
 	"github.com/vanus-labs/vanus/server/store/block/raw"
 	raft "github.com/vanus-labs/vanus/server/store/raft/block"

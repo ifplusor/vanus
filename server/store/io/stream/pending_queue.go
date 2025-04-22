@@ -39,12 +39,12 @@ func (pn *pendingNode) onTimeout() {
 	pn.task.OnTimeout(pn)
 }
 
-type pendingQueue struct {
+type PendingQueue struct {
 	q     blocking.Queue[*pendingNode]
 	delay time.Duration
 }
 
-func (pq *pendingQueue) init(delay time.Duration) *pendingQueue {
+func (pq *PendingQueue) init(delay time.Duration) *PendingQueue {
 	// NOTE: delay is short.
 	pq.delay = delay
 
@@ -53,11 +53,11 @@ func (pq *pendingQueue) init(delay time.Duration) *pendingQueue {
 	return pq
 }
 
-func (pq *pendingQueue) Close() {
+func (pq *PendingQueue) Close() {
 	pq.q.Close()
 }
 
-func (pq *pendingQueue) run() {
+func (pq *PendingQueue) run() {
 	now := time.Now()
 	for {
 		node, ok := pq.q.UniquePop()
@@ -90,7 +90,7 @@ func (pq *pendingQueue) run() {
 	}
 }
 
-func (pq *pendingQueue) Push(t PendingTask) PendingID {
+func (pq *PendingQueue) Push(t PendingTask) PendingID {
 	node := &pendingNode{
 		task:     t,
 		deadline: time.Now().Add(pq.delay),
@@ -99,7 +99,7 @@ func (pq *pendingQueue) Push(t PendingTask) PendingID {
 	return node
 }
 
-func (pq *pendingQueue) Cancel(pid PendingID) {
+func (pq *PendingQueue) Cancel(pid PendingID) {
 	node, _ := pid.(*pendingNode)
 	atomic.StoreInt32(&node.state, 1)
 }
